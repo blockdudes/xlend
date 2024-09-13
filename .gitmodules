@@ -1,3 +1,12 @@
 [submodule "equito.contract/lib/forge-std"]
 	path = equito.contract/lib/forge-std
 	url = https://github.com/foundry-rs/forge-std
+[submodule "equito.contract/lib/equito"]
+	path = equito.contract/lib/equito
+	url = https://github.com/equito-network/equito-evm-contracts.git
+[submodule "equito.contract/lib/openzeppelin-contracts"]
+	path = equito.contract/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
+[submodule "equito.contract/lib/chainlink-brownie-contracts"]
+	path = equito.contract/lib/chainlink-brownie-contracts
+	url = https://github.com/smartcontractkit/chainlink-brownie-contracts
