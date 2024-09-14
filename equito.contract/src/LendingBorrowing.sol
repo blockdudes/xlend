@@ -23,12 +23,13 @@ contract LendingBorrowing is EquitoApp {
         public assets;
     mapping(uint256 chainSelector => address[] supportedAssets)
         public supportedAssets;
+    uint256[] public supportedChains;
     mapping(uint256 chainSelector => mapping(address token => mapping(address user => UserAccount userAccount)))
         public userAccounts;
 
-    uint256 public constant COLLATERAL_FACTOR = 80; // 80% collateral factor
     uint256 public constant PRICE_FEED_DECIMALS = 8;
     uint256 public immutable chain;
+    uint256 public collateralFactor;
 
     event Supplied(
         uint256 chainSelector,
@@ -54,9 +55,33 @@ contract LendingBorrowing is EquitoApp {
         address user,
         uint256 amount
     );
+    event CollateralFactorUpdated(uint256 newFactor);
+    event AssetAdded(
+        uint256 chainSelector,
+        address token,
+        address priceFeedAddress
+    );
+    event PriceFeedUpdated(
+        uint256 chainSelector,
+        address token,
+        address newPriceFeedAddress
+    );
+
+    error ChainNotSupported();
+    error ChainAlreadySupported();
+    error AssetNotSupported();
+    error InsufficientCollateral();
+    error IncorrectEthAmount();
+    error InsufficientBalance();
+    error WithdrawalExceedsCollateralRatio();
 
     constructor(address _router, uint256 _chainSelector) EquitoApp(_router) {
         chain = _chainSelector;
+        collateralFactor = 80; // Initial 80% collateral factor
+    }
+
+    function setSupportedChains(uint256[] memory chainSelectors) external onlyOwner {
+        supportedChains = chainSelectors;
     }
 
     function addAsset(
@@ -64,50 +89,55 @@ contract LendingBorrowing is EquitoApp {
         address token,
         address priceFeedAddress
     ) external onlyOwner {
+        bool isSupported = false;
+        for (uint256 i = 0; i < supportedChains.length; i++) {
+            if (supportedChains[i] == chainSelector) isSupported = true;
+        }
+        if (!isSupported) revert ChainNotSupported();
         assets[chainSelector][token] = Asset(token, priceFeedAddress, 0, 0);
         supportedAssets[chainSelector].push(token);
+        emit AssetAdded(chainSelector, token, priceFeedAddress);
+
+        bytes memory messageData = abi.encode(
+            "addAsset",
+            abi.encode(chainSelector, token, priceFeedAddress)
+        );
+        _sendMessageToAllPeers(messageData);
     }
 
-    function supply(
-        uint256 chainSelector,
-        address token,
-        uint256 amount
-    ) external payable {
-        require(
-            assets[chainSelector][token].token != address(0),
-            "Asset not supported"
-        );
+    function supply(address token, uint256 amount) external payable {
+        if (assets[chain][token].token == address(0))
+            revert AssetNotSupported();
 
         if (token == address(0)) {
-            require(msg.value == amount, "Incorrect ETH amount");
+            if (msg.value != amount) revert IncorrectEthAmount();
         } else {
             IERC20(token).transferFrom(msg.sender, address(this), amount);
         }
 
-        assets[chainSelector][token].totalSupply += amount;
-        userAccounts[chainSelector][token][msg.sender].supplied += amount;
+        assets[chain][token].totalSupply += amount;
+        userAccounts[chain][token][msg.sender].supplied += amount;
+        emit Supplied(chain, token, msg.sender, amount);
 
-        emit Supplied(chainSelector, token, msg.sender, amount);
+        bytes memory messageData = abi.encode(
+            "supply",
+            abi.encode(msg.sender, chain, token, amount)
+        );
+        _sendMessageToAllPeers(messageData);
     }
 
-    function borrow(
-        uint256 chainSelector,
-        address token,
-        uint256 amount
-    ) external {
-        require(
-            assets[chainSelector][token].token != address(0),
-            "Asset not supported"
-        );
-        require(
-            (getCollateralValue(msg.sender) * COLLATERAL_FACTOR) / 100 >=
-                getBorrowedValue(msg.sender) +
-                    getAssetValue(chainSelector, token, amount),
-            "Insufficient collateral"
-        );
+    function borrow(address token, uint256 amount) external {
+        if (assets[chain][token].token == address(0))
+            revert AssetNotSupported();
+        if (
+            (getCollateralValue(msg.sender) * collateralFactor) / 100 <
+            getBorrowedValue(msg.sender) + getAssetValue(chain, token, amount)
+        ) {
+            revert InsufficientCollateral();
+        }
 
-        assets[chainSelector][token].totalBorrowed += amount;
-        userAccounts[chainSelector][token][msg.sender].borrowed += amount;
+        assets[chain][token].totalBorrowed += amount;
+        userAccounts[chain][token][msg.sender].borrowed += amount;
 
         if (token == address(0)) {
             payable(msg.sender).transfer(amount);
@@ -115,56 +145,54 @@ contract LendingBorrowing is EquitoApp {
             IERC20(token).transfer(msg.sender, amount);
         }
 
-        emit Borrowed(chainSelector, token, msg.sender, amount);
+        emit Borrowed(chain, token, msg.sender, amount);
+
+        bytes memory messageData = abi.encode(
+            "borrow",
+            abi.encode(msg.sender, chain, token, amount)
+        );
+        _sendMessageToAllPeers(messageData);
     }
 
-    function repay(
-        uint256 chainSelector,
-        address token,
-        uint256 amount
-    ) external payable {
-        require(
-            assets[chainSelector][token].token != address(0),
-            "Asset not supported"
-        );
+    function repay(address token, uint256 amount) external payable {
+        if (assets[chain][token].token == address(0))
+            revert AssetNotSupported();
 
         if (token == address(0)) {
-            require(msg.value == amount, "Incorrect ETH amount");
+            if (msg.value != amount) revert IncorrectEthAmount();
         } else {
             IERC20(token).transferFrom(msg.sender, address(this), amount);
         }
 
-        uint256 borrowed = userAccounts[chainSelector][token][msg.sender]
-            .borrowed;
+        uint256 borrowed = userAccounts[chain][token][msg.sender].borrowed;
         uint256 repayAmount = amount > borrowed ? borrowed : amount;
 
-        assets[chainSelector][token].totalBorrowed -= repayAmount;
-        userAccounts[chainSelector][token][msg.sender].borrowed -= repayAmount;
+        assets[chain][token].totalBorrowed -= repayAmount;
+        userAccounts[chain][token][msg.sender].borrowed -= repayAmount;
 
-        emit Repaid(chainSelector, token, msg.sender, repayAmount);
+        emit Repaid(chain, token, msg.sender, repayAmount);
+
+        bytes memory messageData = abi.encode(
+            "repay",
+            abi.encode(msg.sender, chain, token, repayAmount)
+        );
+        _sendMessageToAllPeers(messageData);
     }
 
-    function withdraw(
-        uint256 chainSelector,
-        address token,
-        uint256 amount
-    ) external {
-        require(
-            assets[chainSelector][token].token != address(0),
-            "Asset not supported"
-        );
-        require(
-            userAccounts[chainSelector][token][msg.sender].supplied >= amount,
-            "Insufficient balance"
-        );
-        require(
-            (getCollateralValue(msg.sender) * COLLATERAL_FACTOR) / 100 >=
-                getBorrowedValue(msg.sender),
-            "Withdrawal would exceed collateral ratio"
-        );
+    function withdraw(address token, uint256 amount) external {
+        if (assets[chain][token].token == address(0))
+            revert AssetNotSupported();
+        if (userAccounts[chain][token][msg.sender].supplied < amount)
+            revert InsufficientBalance();
+        if (
+            (getCollateralValue(msg.sender) * collateralFactor) / 100 <
+            getBorrowedValue(msg.sender)
+        ) {
+            revert WithdrawalExceedsCollateralRatio();
+        }
 
-        assets[chainSelector][token].totalSupply -= amount;
-        userAccounts[chainSelector][token][msg.sender].supplied -= amount;
+        assets[chain][token].totalSupply -= amount;
+        userAccounts[chain][token][msg.sender].supplied -= amount;
 
         if (token == address(0)) {
             payable(msg.sender).transfer(amount);
@@ -172,12 +200,42 @@ contract LendingBorrowing is EquitoApp {
             IERC20(token).transfer(msg.sender, amount);
         }
 
-        emit Withdrawn(chainSelector, token, msg.sender, amount);
+        emit Withdrawn(chain, token, msg.sender, amount);
+
+        bytes memory messageData = abi.encode(
+            "withdraw",
+            abi.encode(msg.sender, chain, token, amount)
+        );
+        _sendMessageToAllPeers(messageData);
+    }
+
+    function setCollateralFactor(uint256 _newFactor) external onlyOwner {
+        require(
+            _newFactor > 0 && _newFactor <= 100,
+            "Invalid collateral factor"
+        );
+        collateralFactor = _newFactor;
+        emit CollateralFactorUpdated(_newFactor);
+    }
+
+    function updatePriceFeed(
+        address token,
+        address newPriceFeedAddress
+    ) external onlyOwner {
+        if (assets[chain][token].token == address(0))
+            revert AssetNotSupported();
+        assets[chain][token].priceFeedAddress = newPriceFeedAddress;
+        emit PriceFeedUpdated(chain, token, newPriceFeedAddress);
+
+        bytes memory messageData = abi.encode(
+            "updatePriceFeed",
+            abi.encode(chain, token, newPriceFeedAddress)
+        );
+        _sendMessageToAllPeers(messageData);
     }
 
     function getCollateralValue(address user) public view returns (uint256) {
         uint256 totalValue = 0;
-        uint256[] memory supportedChains = getSupportedChains();
 
         for (uint256 i = 0; i < supportedChains.length; i++) {
             uint256 chainSelector = supportedChains[i];
@@ -196,7 +254,6 @@ contract LendingBorrowing is EquitoApp {
 
     function getBorrowedValue(address user) public view returns (uint256) {
         uint256 totalValue = 0;
-        uint256[] memory supportedChains = getSupportedChains();
 
         for (uint256 i = 0; i < supportedChains.length; i++) {
             uint256 chainSelector = supportedChains[i];
@@ -227,11 +284,8 @@ contract LendingBorrowing is EquitoApp {
         return (uint256(price) * amount) / (10 ** IERC20(token).decimals());
     }
 
-    function getSupportedChains() public pure returns (uint256[] memory) {
-        uint256[] memory chains = new uint256[](2);
-        chains[0] = 1001; // Ethereum Sepolia
-        chains[1] = 1003; // Polygon Amoy
-        return chains;
+    function getSupportedChains() public view returns (uint256[] memory) {
+        return supportedChains;
     }
 
     function getSupportedAssets(
@@ -240,13 +294,104 @@ contract LendingBorrowing is EquitoApp {
         return supportedAssets[chainSelector];
     }
 
-    function _receiveMessageFromPeer(
-        EquitoMessage calldata message,
-        bytes calldata messageData
-    ) internal override {
-        // Handle cross-chain messages here
-        // This could include updating user balances, processing cross-chain borrows, etc.
+    function _sendMessageToAllPeers(bytes memory messageData) internal {
+        for (uint256 i = 0; i < supportedChains.length; i++) {
+            uint256 _chainSelector = supportedChains[i];
+            address peerAddress = EquitoMessageLibrary.bytes64ToAddress(
+                getPeer(_chainSelector)
+            );
+            if ((peerAddress != address(0)) && (peerAddress != address(this))) {
+                router.sendMessage(
+                    EquitoMessageLibrary.addressToBytes64(peerAddress),
+                    _chainSelector,
+                    messageData
+                );
+            }
+        }
     }
 
-    receive() external payable {}
+    function _receiveMessageFromPeer(
+        EquitoMessage calldata /* message */,
+        bytes calldata messageData
+    ) internal override {
+        (string memory functionName, bytes memory data) = abi.decode(
+            messageData,
+            (string, bytes)
+        );
+
+        if (
+            keccak256(abi.encodePacked(functionName)) ==
+            keccak256(abi.encodePacked("addAsset"))
+        ) {
+            (
+                uint256 chainSelector,
+                address token,
+                address priceFeedAddress
+            ) = abi.decode(data, (uint256, address, address));
+            assets[chainSelector][token] = Asset(token, priceFeedAddress, 0, 0);
+            supportedAssets[chainSelector].push(token);
+        } else if (
+            keccak256(abi.encodePacked(functionName)) ==
+            keccak256(abi.encodePacked("supply"))
+        ) {
+            (
+                address sender,
+                uint256 chainSelector,
+                address token,
+                uint256 amount
+            ) = abi.decode(data, (address, uint256, address, uint256));
+            assets[chainSelector][token].totalSupply += amount;
+            userAccounts[chainSelector][token][sender].supplied += amount;
+        } else if (
+            keccak256(abi.encodePacked(functionName)) ==
+            keccak256(abi.encodePacked("borrow"))
+        ) {
+            (
+                address sender,
+                uint256 chainSelector,
+                address token,
+                uint256 amount
+            ) = abi.decode(data, (address, uint256, address, uint256));
+            assets[chainSelector][token].totalBorrowed += amount;
+            userAccounts[chainSelector][token][sender].borrowed += amount;
+        } else if (
+            keccak256(abi.encodePacked(functionName)) ==
+            keccak256(abi.encodePacked("repay"))
+        ) {
+            (
+                address sender,
+                uint256 chainSelector,
+                address token,
+                uint256 amount
+            ) = abi.decode(data, (address, uint256, address, uint256));
+            uint256 borrowed = userAccounts[chainSelector][token][sender]
+                .borrowed;
+            uint256 repayAmount = amount > borrowed ? borrowed : amount;
+
+            assets[chainSelector][token].totalBorrowed -= repayAmount;
+            userAccounts[chainSelector][token][sender].borrowed -= repayAmount;
+        } else if (
+            keccak256(abi.encodePacked(functionName)) ==
+            keccak256(abi.encodePacked("withdraw"))
+        ) {
+            (
+                address sender,
+                uint256 chainSelector,
+                address token,
+                uint256 amount
+            ) = abi.decode(data, (address, uint256, address, uint256));
+            assets[chainSelector][token].totalSupply -= amount;
+            userAccounts[chainSelector][token][sender].supplied -= amount;
+        } else if (
+            keccak256(abi.encodePacked(functionName)) ==
+            keccak256(abi.encodePacked("updatePriceFeed"))
+        ) {
+            (
+                uint256 chainSelector,
+                address token,
+                address newPriceFeedAddress
+            ) = abi.decode(data, (uint256, address, address));
+            assets[chainSelector][token].priceFeedAddress = newPriceFeedAddress;
+        }
+    }
 }
