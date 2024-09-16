@@ -27,6 +27,7 @@ contract LendingBorrowing is EquitoApp {
     mapping(uint256 chainSelector => mapping(address token => mapping(address user => UserAccount userAccount)))
         public userAccounts;
 
+    address public constant NATIVE_ADDRESS = address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
     uint256 public constant PRICE_FEED_DECIMALS = 8;
     uint256 public immutable chain;
     uint256 public collateralFactor;
@@ -109,7 +110,7 @@ contract LendingBorrowing is EquitoApp {
         if (assets[chain][token].token == address(0))
             revert AssetNotSupported();
 
-        if (token == address(0)) {
+        if (token == address(NATIVE_ADDRESS)) {
             if (msg.value != amount) revert IncorrectEthAmount();
         } else {
             IERC20(token).transferFrom(msg.sender, address(this), amount);
@@ -131,7 +132,7 @@ contract LendingBorrowing is EquitoApp {
             revert AssetNotSupported();
         if (
             (getCollateralValue(msg.sender) * collateralFactor) / 100 <
-            getBorrowedValue(msg.sender) + getAssetValue(chain, token, amount)
+            getBorrowedValue(msg.sender) + getAssetValueInUsd(chain, token, amount)
         ) {
             revert InsufficientCollateral();
         }
@@ -139,7 +140,7 @@ contract LendingBorrowing is EquitoApp {
         assets[chain][token].totalBorrowed += amount;
         userAccounts[chain][token][msg.sender].borrowed += amount;
 
-        if (token == address(0)) {
+        if (token == address(NATIVE_ADDRESS)) {
             payable(msg.sender).transfer(amount);
         } else {
             IERC20(token).transfer(msg.sender, amount);
@@ -158,7 +159,7 @@ contract LendingBorrowing is EquitoApp {
         if (assets[chain][token].token == address(0))
             revert AssetNotSupported();
 
-        if (token == address(0)) {
+        if (token == address(NATIVE_ADDRESS)) {
             if (msg.value != amount) revert IncorrectEthAmount();
         } else {
             IERC20(token).transferFrom(msg.sender, address(this), amount);
@@ -194,7 +195,7 @@ contract LendingBorrowing is EquitoApp {
         assets[chain][token].totalSupply -= amount;
         userAccounts[chain][token][msg.sender].supplied -= amount;
 
-        if (token == address(0)) {
+        if (token == address(NATIVE_ADDRESS)) {
             payable(msg.sender).transfer(amount);
         } else {
             IERC20(token).transfer(msg.sender, amount);
@@ -245,7 +246,7 @@ contract LendingBorrowing is EquitoApp {
                 address token = _supportedAssets[j];
                 uint256 supplied = userAccounts[chainSelector][token][user]
                     .supplied;
-                totalValue += getAssetValue(chainSelector, token, supplied);
+                totalValue += getAssetValueInUsd(chainSelector, token, supplied);
             }
         }
 
@@ -263,14 +264,14 @@ contract LendingBorrowing is EquitoApp {
                 address token = _supportedAssets[j];
                 uint256 borrowed = userAccounts[chainSelector][token][user]
                     .borrowed;
-                totalValue += getAssetValue(chainSelector, token, borrowed);
+                totalValue += getAssetValueInUsd(chainSelector, token, borrowed);
             }
         }
 
         return totalValue;
     }
 
-    function getAssetValue(
+    function getAssetValueInUsd(
         uint256 chainSelector,
         address token,
         uint256 amount

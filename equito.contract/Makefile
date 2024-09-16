@@ -1,12 +1,11 @@
 include .env
 
-deploy-polygon:
+deploy-arbitrum:
 	forge create $(CONTRACT_PATH) \
-		--constructor-args ${POLYGON_AMOY_ROUTER_CONTRACT_ADDRESS} ${POLYGON_AMOY
-		_CHAIN_SELECTOR} \
+		--constructor-args ${ARBITRUM_SEPOLIA_ROUTER_CONTRACT_ADDRESS} ${ARBITRUM_SEPOLIA_CHAIN_SELECTOR} \
 		--private-key $(PRIVATE_KEY) \
-	    --rpc-url ${POLYGON_AMOY_RPC_URL} \
-		--etherscan-api-key ${POLYGONSCAN_API_KEY} \
+	    --rpc-url ${ARBITRUM_SEPOLIA_RPC_URL} \
+		--etherscan-api-key ${ARBISCAN_API_KEY} \
 		--verify
 
 deploy-sepolia:
