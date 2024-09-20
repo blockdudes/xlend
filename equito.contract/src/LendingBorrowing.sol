@@ -23,13 +23,13 @@ contract LendingBorrowing is EquitoApp {
         public assets;
     mapping(uint256 chainSelector => address[] supportedAssets)
         public supportedAssets;
-    uint256[] public supportedChains;
     mapping(uint256 chainSelector => mapping(address token => mapping(address user => UserAccount userAccount)))
         public userAccounts;
 
-    address public constant NATIVE_ADDRESS = address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
-    uint256 public constant PRICE_FEED_DECIMALS = 8;
+    address public constant NATIVE_ADDRESS =
+        address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
     uint256 public immutable chain;
+    address public immutable routerAddress;
     uint256 public collateralFactor;
 
     event Supplied(
@@ -56,7 +56,6 @@ contract LendingBorrowing is EquitoApp {
         address user,
         uint256 amount
     );
-    event CollateralFactorUpdated(uint256 newFactor);
     event AssetAdded(
         uint256 chainSelector,
         address token,
@@ -68,6 +67,7 @@ contract LendingBorrowing is EquitoApp {
         address newPriceFeedAddress
     );
 
+    error InsufficientEthForRouterFee();
     error ChainNotSupported();
     error ChainAlreadySupported();
     error AssetNotSupported();
@@ -75,26 +75,40 @@ contract LendingBorrowing is EquitoApp {
     error IncorrectEthAmount();
     error InsufficientBalance();
     error WithdrawalExceedsCollateralRatio();
+    error PaymentExceedsBorrowedAmount();
+    error UnableToGetRouterFee();
 
-    constructor(address _router, uint256 _chainSelector) EquitoApp(_router) {
+    constructor(
+        address _router,
+        uint256 _chainSelector,
+        address nativeToUsdPriceFeed
+    ) EquitoApp(_router) {
+        routerAddress = _router;
         chain = _chainSelector;
-        collateralFactor = 80; // Initial 80% collateral factor
+        collateralFactor = 80;
+        assets[_chainSelector][NATIVE_ADDRESS] = Asset(
+            NATIVE_ADDRESS,
+            nativeToUsdPriceFeed,
+            0,
+            0
+        );
+        supportedAssets[_chainSelector].push(NATIVE_ADDRESS);
     }
 
-    function setSupportedChains(uint256[] memory chainSelectors) external onlyOwner {
-        supportedChains = chainSelectors;
+    modifier routerFeeCheck() {
+        uint256 routerFee = getRouterFee();
+        if (routerFee > msg.value) revert InsufficientEthForRouterFee();
+        _;
     }
 
     function addAsset(
         uint256 chainSelector,
         address token,
         address priceFeedAddress
-    ) external onlyOwner {
-        bool isSupported = false;
-        for (uint256 i = 0; i < supportedChains.length; i++) {
-            if (supportedChains[i] == chainSelector) isSupported = true;
-        }
-        if (!isSupported) revert ChainNotSupported();
+    ) external payable onlyOwner routerFeeCheck {
+        uint256 routerFee = getRouterFee();
+        if (chainSelector != 1001 && chainSelector != 1004)
+            revert ChainNotSupported();
         assets[chainSelector][token] = Asset(token, priceFeedAddress, 0, 0);
         supportedAssets[chainSelector].push(token);
         emit AssetAdded(chainSelector, token, priceFeedAddress);
@@ -103,15 +117,31 @@ contract LendingBorrowing is EquitoApp {
             "addAsset",
             abi.encode(chainSelector, token, priceFeedAddress)
         );
-        _sendMessageToAllPeers(messageData);
+        if (chain == 1001) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1004),
+                1004,
+                messageData
+            );
+        } else if (chain == 1004) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1001),
+                1001,
+                messageData
+            );
+        }
     }
 
-    function supply(address token, uint256 amount) external payable {
+    function supply(
+        address token,
+        uint256 amount
+    ) external payable routerFeeCheck {
         if (assets[chain][token].token == address(0))
             revert AssetNotSupported();
 
+        uint256 routerFee = getRouterFee();
         if (token == address(NATIVE_ADDRESS)) {
-            if (msg.value != amount) revert IncorrectEthAmount();
+            if (msg.value - routerFee != amount) revert IncorrectEthAmount();
         } else {
             IERC20(token).transferFrom(msg.sender, address(this), amount);
         }
@@ -124,15 +154,31 @@ contract LendingBorrowing is EquitoApp {
             "supply",
             abi.encode(msg.sender, chain, token, amount)
         );
-        _sendMessageToAllPeers(messageData);
+        if (chain == 1001) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1004),
+                1004,
+                messageData
+            );
+        } else if (chain == 1004) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1001),
+                1001,
+                messageData
+            );
+        }
     }
 
-    function borrow(address token, uint256 amount) external {
+    function borrow(
+        address token,
+        uint256 amount
+    ) external payable routerFeeCheck {
         if (assets[chain][token].token == address(0))
             revert AssetNotSupported();
         if (
             (getCollateralValue(msg.sender) * collateralFactor) / 100 <
-            getBorrowedValue(msg.sender) + getAssetValueInUsd(chain, token, amount)
+            getBorrowedValue(msg.sender) +
+                getAssetValueInUsd(chain, token, amount)
         ) {
             revert InsufficientCollateral();
         }
@@ -152,35 +198,69 @@ contract LendingBorrowing is EquitoApp {
             "borrow",
             abi.encode(msg.sender, chain, token, amount)
         );
-        _sendMessageToAllPeers(messageData);
+        uint256 routerFee = getRouterFee();
+        if (chain == 1001) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1004),
+                1004,
+                messageData
+            );
+        } else if (chain == 1004) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1001),
+                1001,
+                messageData
+            );
+        }
     }
 
-    function repay(address token, uint256 amount) external payable {
+    function repay(
+        address token,
+        uint256 amount
+    ) external payable routerFeeCheck {
         if (assets[chain][token].token == address(0))
             revert AssetNotSupported();
 
+        uint256 routerFee = getRouterFee();
         if (token == address(NATIVE_ADDRESS)) {
-            if (msg.value != amount) revert IncorrectEthAmount();
+            if (msg.value - routerFee != amount) revert IncorrectEthAmount();
         } else {
             IERC20(token).transferFrom(msg.sender, address(this), amount);
         }
 
         uint256 borrowed = userAccounts[chain][token][msg.sender].borrowed;
-        uint256 repayAmount = amount > borrowed ? borrowed : amount;
+        if (amount > borrowed) {
+            revert PaymentExceedsBorrowedAmount();
+        }
 
-        assets[chain][token].totalBorrowed -= repayAmount;
-        userAccounts[chain][token][msg.sender].borrowed -= repayAmount;
+        assets[chain][token].totalBorrowed -= amount;
+        userAccounts[chain][token][msg.sender].borrowed -= amount;
 
-        emit Repaid(chain, token, msg.sender, repayAmount);
+        emit Repaid(chain, token, msg.sender, amount);
 
         bytes memory messageData = abi.encode(
             "repay",
-            abi.encode(msg.sender, chain, token, repayAmount)
+            abi.encode(msg.sender, chain, token, amount)
         );
-        _sendMessageToAllPeers(messageData);
+        if (chain == 1001) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1004),
+                1004,
+                messageData
+            );
+        } else if (chain == 1004) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1001),
+                1001,
+                messageData
+            );
+        }
     }
 
-    function withdraw(address token, uint256 amount) external {
+    function withdraw(
+        address token,
+        uint256 amount
+    ) external payable routerFeeCheck {
         if (assets[chain][token].token == address(0))
             revert AssetNotSupported();
         if (userAccounts[chain][token][msg.sender].supplied < amount)
@@ -207,22 +287,27 @@ contract LendingBorrowing is EquitoApp {
             "withdraw",
             abi.encode(msg.sender, chain, token, amount)
         );
-        _sendMessageToAllPeers(messageData);
-    }
 
-    function setCollateralFactor(uint256 _newFactor) external onlyOwner {
-        require(
-            _newFactor > 0 && _newFactor <= 100,
-            "Invalid collateral factor"
-        );
-        collateralFactor = _newFactor;
-        emit CollateralFactorUpdated(_newFactor);
+        uint256 routerFee = getRouterFee();
+        if (chain == 1001) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1004),
+                1004,
+                messageData
+            );
+        } else if (chain == 1004) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1001),
+                1001,
+                messageData
+            );
+        }
     }
 
     function updatePriceFeed(
         address token,
-        address newPriceFeedAddress
-    ) external onlyOwner {
+        address newPriceFeedAddress,
+    ) external payable routerFeeCheck {
         if (assets[chain][token].token == address(0))
             revert AssetNotSupported();
         assets[chain][token].priceFeedAddress = newPriceFeedAddress;
@@ -232,12 +317,35 @@ contract LendingBorrowing is EquitoApp {
             "updatePriceFeed",
             abi.encode(chain, token, newPriceFeedAddress)
         );
-        _sendMessageToAllPeers(messageData);
+        uint256 routerFee = getRouterFee();
+        if (chain == 1001) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1004),
+                1004,
+                messageData
+            );
+        } else if (chain == 1004) {
+            router.sendMessage{value: routerFee}(
+                getPeer(1001),
+                1001,
+                messageData
+            );
+        }
+    }
+
+    function getRouterFee() public view returns (uint256) {
+        (bool success, bytes memory data) = routerAddress.staticcall(
+            abi.encodeWithSignature("getFee(address)", address(this))
+        );
+        if (!success) {
+            revert UnableToGetRouterFee();
+        }
+        return abi.decode(data, (uint256));
     }
 
     function getCollateralValue(address user) public view returns (uint256) {
         uint256 totalValue = 0;
-
+        uint256[] memory supportedChains = getSupportedChains();
         for (uint256 i = 0; i < supportedChains.length; i++) {
             uint256 chainSelector = supportedChains[i];
             address[] memory _supportedAssets = supportedAssets[chainSelector];
@@ -246,7 +354,13 @@ contract LendingBorrowing is EquitoApp {
                 address token = _supportedAssets[j];
                 uint256 supplied = userAccounts[chainSelector][token][user]
                     .supplied;
-                totalValue += getAssetValueInUsd(chainSelector, token, supplied);
+                if (supplied > 0) {
+                    totalValue += getAssetValueInUsd(
+                        chainSelector,
+                        token,
+                        supplied
+                    );
+                }
             }
         }
 
@@ -255,7 +369,7 @@ contract LendingBorrowing is EquitoApp {
 
     function getBorrowedValue(address user) public view returns (uint256) {
         uint256 totalValue = 0;
-
+        uint256[] memory supportedChains = getSupportedChains();
         for (uint256 i = 0; i < supportedChains.length; i++) {
             uint256 chainSelector = supportedChains[i];
             address[] memory _supportedAssets = supportedAssets[chainSelector];
@@ -264,7 +378,13 @@ contract LendingBorrowing is EquitoApp {
                 address token = _supportedAssets[j];
                 uint256 borrowed = userAccounts[chainSelector][token][user]
                     .borrowed;
-                totalValue += getAssetValueInUsd(chainSelector, token, borrowed);
+                if (borrowed > 0) {
+                    totalValue += getAssetValueInUsd(
+                        chainSelector,
+                        token,
+                        borrowed
+                    );
+                }
             }
         }
 
@@ -281,11 +401,18 @@ contract LendingBorrowing is EquitoApp {
             (, price, , , ) = AggregatorV3Interface(
                 assets[chainSelector][token].priceFeedAddress
             ).latestRoundData();
+            uint256 decimals = AggregatorV3Interface(
+                assets[chainSelector][token].priceFeedAddress
+            ).decimals();
+            return (uint256(price) * amount) / (10 ** decimals);
         }
-        return (uint256(price) * amount) / (10 ** IERC20(token).decimals());
+        return amount;
     }
 
-    function getSupportedChains() public view returns (uint256[] memory) {
+    function getSupportedChains() public pure returns (uint256[] memory) {
+        uint256[] memory supportedChains = new uint256[](2);
+        supportedChains[0] = 1001;
+        supportedChains[1] = 1004;
         return supportedChains;
     }
 
@@ -293,22 +420,6 @@ contract LendingBorrowing is EquitoApp {
         uint256 chainSelector
     ) public view returns (address[] memory) {
         return supportedAssets[chainSelector];
-    }
-
-    function _sendMessageToAllPeers(bytes memory messageData) internal {
-        for (uint256 i = 0; i < supportedChains.length; i++) {
-            uint256 _chainSelector = supportedChains[i];
-            address peerAddress = EquitoMessageLibrary.bytes64ToAddress(
-                getPeer(_chainSelector)
-            );
-            if ((peerAddress != address(0)) && (peerAddress != address(this))) {
-                router.sendMessage(
-                    EquitoMessageLibrary.addressToBytes64(peerAddress),
-                    _chainSelector,
-                    messageData
-                );
-            }
-        }
     }
 
     function _receiveMessageFromPeer(
